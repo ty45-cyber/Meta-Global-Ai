@@ -1,0 +1,27 @@
+{
+  "name": "btech-meta-vpse",
+  "version": "1.0.0",
+  "description": "BTech Solutions: Verifiable Physical-to-System Engine (VPSE-Rx) for Meta Global AI Hackathon",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "dev": "vite",
+    "build": "vite build",
+    "test": "bun test src/vpseVerification.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "openai": "^4.86.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.4",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0"
+  }
+}
