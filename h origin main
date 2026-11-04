@@ -1,0 +1,13 @@
+warning: in the working copy of '.env.example', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/byzantineConsensusOrchestrator.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/epistemicFirewall.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/glimmerVoiceIngress.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/rleMetrologyKernel.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/samParallelEngine.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/server.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/sparkExecutor.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/ui/TelemetryApp.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/volumetricPharmacokineticKernel.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/vpseVerification.test.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/wonderArbitrator.ts', LF will be replaced by CRLF the next time Git touches it

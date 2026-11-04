@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { decodeMaskToRaster } from "@meta-sam/parser";
 import { RleBitstreamScanner, RleSpan } from "./rleMetrologyKernel";
 
 export interface SamFrameWirePayload {
@@ -75,7 +76,8 @@ export class SamWireExtractor {
 
   public extractFrameRleWire(
     rawWireText: string,
-    expectedFrameIndex: number
+    expectedFrameIndex: number,
+    targetFramePixels?: number
   ): SamFrameWirePayload {
     if (!rawWireText || rawWireText.trim().length === 0) {
       throw new Error("SAM 3.1 wire extraction failed: empty response payload.");
@@ -88,6 +90,113 @@ export class SamWireExtractor {
     const frameStart = rawWireText.indexOf(frameTag);
     const searchSlice =
       frameStart !== -1 ? rawWireText.slice(frameStart + frameTag.length) : rawWireText;
+
+    // Live Meta SAM 3.1 Responses API special-token wire grammar:
+    // `0<|box;x1=...;y1=...;x2=...;y2=...;w=...;h=...|><|mask;x=0;y=0;data=H,W,~...|>`
+    if (searchSlice.includes("<|mask;")) {
+      const boxMatch =
+        /<\|box;x1=(-?\d+);y1=(-?\d+);x2=(-?\d+);y2=(-?\d+);w=(\d+);h=(\d+)(?:;[^|]*)?\|>/.exec(
+          searchSlice
+        );
+      const maskMatch =
+        /<\|mask;x=0;y=0;data=(\d+),(\d+),([!~][^|;]+)(?:;[^|]*)?\|>/.exec(searchSlice);
+
+      if (!boxMatch || !maskMatch) {
+        throw new Error(
+          `SAM 3.1 wire malformed box/mask token grammar for frame ${expectedFrameIndex}.`
+        );
+      }
+
+      const left = Number(boxMatch[1]);
+      const top = Number(boxMatch[2]);
+      const inclusiveRight = Number(boxMatch[3]);
+      const inclusiveBottom = Number(boxMatch[4]);
+      const sourceWidth = Number(boxMatch[5]);
+      const sourceHeight = Number(boxMatch[6]);
+      const maskHeight = Number(maskMatch[1]);
+      const maskWidth = Number(maskMatch[2]);
+      const encodedPayload = maskMatch[3]!;
+
+      const cropRaster = decodeMaskToRaster({
+        encoding: encodedPayload.startsWith("~") ? "lossless" : "one_bit",
+        payload: encodedPayload,
+        width: maskWidth,
+        height: maskHeight,
+      });
+
+      const destWidth =
+        targetFramePixels === undefined || targetFramePixels === sourceWidth * sourceHeight
+          ? sourceWidth
+          : targetFramePixels === 640 * 360
+            ? 640
+            : Math.max(
+                1,
+                Math.floor(Math.sqrt(targetFramePixels * (sourceWidth / sourceHeight)))
+              );
+      const destHeight =
+        targetFramePixels === undefined || targetFramePixels === sourceWidth * sourceHeight
+          ? sourceHeight
+          : Math.max(1, Math.floor(targetFramePixels / destWidth));
+
+      const destTop = Math.max(0, Math.floor((top * destHeight) / sourceHeight));
+      const destBottom = Math.min(
+        destHeight,
+        Math.ceil(((inclusiveBottom + 1) * destHeight) / sourceHeight)
+      );
+      const destLeft = Math.max(0, Math.floor((left * destWidth) / sourceWidth));
+      const destRight = Math.min(
+        destWidth,
+        Math.ceil(((inclusiveRight + 1) * destWidth) / sourceWidth)
+      );
+
+      const runs: number[] = [];
+      let cursor = 0;
+
+      for (let destY = destTop; destY < destBottom; destY++) {
+        const srcRow = Math.min(
+          maskHeight - 1,
+          Math.max(0, Math.floor(((destY + 0.5) * sourceHeight) / destHeight) - top)
+        );
+        let runStartCol = -1;
+        for (let destX = destLeft; destX < destRight; destX++) {
+          const srcCol = Math.min(
+            maskWidth - 1,
+            Math.max(0, Math.floor(((destX + 0.5) * sourceWidth) / destWidth) - left)
+          );
+          const bit = cropRaster[srcRow * maskWidth + srcCol]!;
+          if (bit === 1 && runStartCol === -1) {
+            runStartCol = destX;
+          } else if (bit === 0 && runStartCol !== -1) {
+            const absStart = destY * destWidth + runStartCol;
+            const runLen = destX - runStartCol;
+            runs.push(absStart - cursor, runLen);
+            cursor = absStart + runLen;
+            runStartCol = -1;
+          }
+        }
+        if (runStartCol !== -1) {
+          const absStart = destY * destWidth + runStartCol;
+          const runLen = destRight - runStartCol;
+          runs.push(absStart - cursor, runLen);
+          cursor = absStart + runLen;
+        }
+      }
+
+      if (runs.length === 0) {
+        runs.push(0, 0);
+      }
+
+      return {
+        frameIndex: expectedFrameIndex,
+        normalizedBbox: [
+          left,
+          top,
+          Math.max(1, inclusiveRight - left + 1),
+          Math.max(1, inclusiveBottom - top + 1),
+        ],
+        rawRleString: `~${runs.join(",")}`,
+      };
+    }
 
     const rleDelimiterIndex = searchSlice.indexOf("~");
     if (rleDelimiterIndex === -1) {
@@ -223,7 +332,11 @@ export class SamParallelDispatcher {
     }
 
     const latencyMs = Math.max(1, Math.round(performance.now() - startMs));
-    const framePayload = extractor.extractFrameRleWire(rawWireOutput, frameIndex);
+    const framePayload = extractor.extractFrameRleWire(
+      rawWireOutput,
+      frameIndex,
+      totalFramePixels
+    );
     const spans = scanner.parseWireToSpans(framePayload.rawRleString, totalFramePixels);
 
     return {

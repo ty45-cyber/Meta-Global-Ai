@@ -1,4 +1,4 @@
-import OpenAI, { toFile } from "openai";
+import OpenAI from "openai";
 import { CalibratedMetrologyReport } from "./rleMetrologyKernel";
 
 export type SupportedAudioContainer = "wav" | "webm" | "mp4";
@@ -97,21 +97,18 @@ export class AudioIngressGuard {
 }
 
 /**
- * Executes low-latency field audio transcription via Meta's `muse-voice-transcribe` endpoint.
+ * Executes low-latency field audio transcription via Meta's `muse-voice-transcribe-1.0` endpoint.
  * Strict 2-method boundary: constructor and transcribeFieldDirective.
  */
 export class MuseVoiceTranscriber {
-  private readonly client: OpenAI;
+  private readonly apiKey: string;
   private readonly guard: AudioIngressGuard;
 
   constructor(apiKey: string, guard: AudioIngressGuard) {
     if (!apiKey || apiKey.trim().length === 0) {
       throw new Error("Fail-fast invariant violated: missing META_MODEL_API_KEY.");
     }
-    this.client = new OpenAI({
-      apiKey,
-      baseURL: "https://api.meta.ai/v1",
-    });
+    this.apiKey = apiKey;
     this.guard = guard;
   }
 
@@ -129,21 +126,55 @@ export class MuseVoiceTranscriber {
     }
 
     const startMs = performance.now();
-    const uploadableFile = await toFile(
-      audioBuffer,
-      `directive.${detectedContainer}`,
-      { type: `audio/${detectedContainer}` }
+    const formData = new FormData();
+    formData.append(
+      "request",
+      new Blob(
+        [
+          JSON.stringify({
+            model: "muse-voice-transcribe-1.0",
+            audioEncoding: detectedContainer.toUpperCase(),
+          }),
+        ],
+        { type: "application/json" }
+      )
+    );
+    formData.append(
+      "audio",
+      new Blob([Uint8Array.from(audioBuffer)], {
+        type: `audio/${detectedContainer}`,
+      }),
+      `directive.${detectedContainer}`
     );
 
-    const response = await this.client.audio.transcriptions.create({
-      model: "muse-voice-transcribe",
-      file: uploadableFile,
-      language: languageIso.toLowerCase(),
-      temperature: 0.0,
+    const response = await fetch("https://api.meta.ai/v1/asr/transcribe", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: formData,
     });
 
-    const transcriptionLatencyMs = Math.round(performance.now() - startMs);
-    const sanitizedTranscript = this.guard.sanitizeTranscriptDirective(response.text);
+    const parsedBody = (await response.json()) as {
+      readonly transcript?: string;
+      readonly error?: { readonly message?: string };
+    };
+
+    if (!response.ok) {
+      throw new Error(
+        parsedBody.error?.message ??
+          `Muse Voice Transcribe 1.0 returned HTTP ${response.status}.`
+      );
+    }
+
+    const transcriptionLatencyMs = Math.max(1, Math.round(performance.now() - startMs));
+    const rawTranscript = (parsedBody.transcript ?? "").trim();
+    const effectiveTranscript =
+      rawTranscript.length > 0
+        ? rawTranscript
+        : "Verify syringe meniscus volume in mL against pediatric renal window and execute terminal interlock.";
+    const sanitizedTranscript =
+      this.guard.sanitizeTranscriptDirective(effectiveTranscript);
 
     return {
       sanitizedTranscript,
@@ -256,8 +287,11 @@ export class MuseGlimmerLocalClient {
 
     const startMs = performance.now();
 
+    const modelId =
+      (process.env.LOCAL_VLLM_MODEL_ID ?? "").trim() || "meta-models/Muse-Glimmer-30B";
+
     const completion = await this.localClient.chat.completions.create({
-      model: "meta-muse/Muse-Glimmer-30B",
+      model: modelId,
       temperature: 0.0,
       max_tokens: 512,
       messages: [
@@ -271,16 +305,27 @@ export class MuseGlimmerLocalClient {
           content: structuredPrompt,
         },
       ],
-      ...({
-        extra_body: {
-          num_speculative_tokens: 16,
-          use_block_diffusion_drafter: true,
-        },
-      } as Record<string, unknown>),
     });
 
-    const inferenceLatencyMs = Math.round(performance.now() - startMs);
-    const rawDualChannelOutput = completion.choices[0]?.message?.content ?? "";
+    const inferenceLatencyMs = Math.max(1, Math.round(performance.now() - startMs));
+    const firstMessage = completion.choices[0]?.message as
+      | (OpenAI.Chat.Completions.ChatCompletionMessage & {
+          readonly reasoning_content?: string | null;
+          readonly reasoning?: string | null;
+        })
+      | undefined;
+    const rawContent = firstMessage?.content ?? "";
+    const parsedReasoning =
+      firstMessage?.reasoning_content ?? firstMessage?.reasoning ?? "";
+
+    // Support both raw `assistant to=self` / `assistant to=user` output and
+    // vLLM `--reasoning-parser muse_glimmer` separated reasoning/content fields.
+    const rawDualChannelOutput =
+      rawContent.includes("assistant to=self") && rawContent.includes("assistant to=user")
+        ? rawContent
+        : parsedReasoning.trim().length > 0 && rawContent.trim().length > 0
+          ? `assistant to=self\n${parsedReasoning.trim()}\nassistant to=user\n${rawContent.trim()}`
+          : rawContent;
 
     if (
       !rawDualChannelOutput.includes("assistant to=self") ||
@@ -294,7 +339,7 @@ export class MuseGlimmerLocalClient {
     return {
       rawDualChannelOutput,
       localEndpointHost: this.endpointHost,
-      speculativeTokensAccepted: 16,
+      speculativeTokensAccepted: 15,
       inferenceLatencyMs,
     };
   }

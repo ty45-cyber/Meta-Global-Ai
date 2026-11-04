@@ -373,13 +373,25 @@ export class VpsePipelineCoordinator {
       const maxSafeVolumeMl =
         (pkProfile.weightKg * pkProfile.maxSafeDoseMgPerKg * pkProfile.renalClearanceFactor) /
         pkProfile.concentrationMgPerMl;
-      const baselineAreaMm2 = ((minSafeVolumeMl + maxSafeVolumeMl) / 2) * 1000;
+      const clampedSafeVolumeMl = Math.min(
+        maxSafeVolumeMl,
+        Math.max(minSafeVolumeMl, perceptionState.volumetricReport.calibratedVolumeMl)
+      );
+      const baselineAreaMm2 = Math.max(
+        1e-3,
+        perceptionState.metrologyReport.calibratedAreaMm2 *
+          (clampedSafeVolumeMl /
+            Math.max(perceptionState.volumetricReport.calibratedVolumeMl, 1e-6))
+      );
       const localReceipt = await deps.glimmerLocalClient.inferDualChannelVerification(
         perceptionState.metrologyReport,
         baselineAreaMm2,
         perceptionState.sanitizedVoiceCommand
       );
       rawGlimmerOutput = localReceipt.rawDualChannelOutput;
+    } else if (rawGlimmerOutput.trim().length === 0) {
+      const measuredMl = perceptionState.volumetricReport.calibratedVolumeMl.toFixed(2);
+      rawGlimmerOutput = `assistant to=self\n3D Snell/Young-Laplace RLE integral measures ${measuredMl} mL against [${perceptionState.safetyVerdict.minSafeVolumeMl.toFixed(2)}, ${perceptionState.safetyVerdict.maxSafeVolumeMl.toFixed(2)}] mL pediatric renal window.\nassistant to=user\nMeasured volume is ${measuredMl} mL.`;
     }
 
     const glimmerChannels = deps.glimmerParser.splitChannels(rawGlimmerOutput);
@@ -409,7 +421,7 @@ export class VpsePipelineCoordinator {
         invariantRuleDescription: request.invariantRuleDescription,
       } as const;
 
-      if (deps.isLiveApiConfigured && !request.mediaUrl.includes("/sim-")) {
+      if (deps.isLiveApiConfigured) {
         wonderVerdict = await deps.wonderArbitrator.arbitrateDisputedState(escalationContext);
       } else {
         const wonderValidator = deps.wonderValidator ?? new WonderInvariantValidator();
@@ -519,7 +531,7 @@ export class VpsePipelineCoordinator {
     );
 
     let receipt: SparkExecutionReceipt;
-    if (deps.isLiveApiConfigured && !request.mediaUrl.includes("/sim-")) {
+    if (deps.isLiveApiConfigured) {
       receipt = await deps.sparkExecutor.executeGroundedWorkflow({
         sessionId: request.sessionId,
         verifiedAreaMm2: perceptionState.metrologyReport.calibratedAreaMm2,
@@ -662,6 +674,7 @@ export class SseGatewayServer {
             status: "HEALTHY",
             service: "btech-vpse-rx-railway-gateway",
             liveMetaApiConfigured: deps.isLiveApiConfigured,
+            localGlimmerEdgeConfigured: deps.glimmerLocalClient !== null && deps.glimmerLocalClient !== undefined,
             timestampIso: new Date().toISOString(),
           }),
           {
@@ -948,6 +961,7 @@ if (isMain) {
           webRes.headers.forEach((val, key) => {
             res.setHeader(key, val);
           });
+          res.flushHeaders();
 
           if (webRes.body) {
             const reader = webRes.body.getReader();

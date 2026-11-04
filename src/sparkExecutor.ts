@@ -130,17 +130,15 @@ export class MuseSparkExecutor {
 
     const response = await this.client.chat.completions.create({
       model: "muse-spark-1.3",
+      reasoning_effort: "low",
       temperature: 0.0,
       tools,
-      tool_choice: {
-        type: "function",
-        function: { name: "commit_legacy_viewport_action" },
-      },
+      tool_choice: "auto",
       messages: [
         {
           role: "system",
           content:
-            "You are a deterministic execution controller. Dispatch the verified physical metrology and commitment hash to the calibrated viewport coordinates.",
+            "You are a deterministic execution controller. Always call the commit_legacy_viewport_action tool to dispatch the verified physical metrology and commitment hash to the calibrated viewport coordinates.",
         },
         {
           role: "user",

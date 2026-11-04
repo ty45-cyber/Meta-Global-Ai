@@ -134,6 +134,7 @@ export class MuseWonderArbitrator {
 
     const completion = await this.client.chat.completions.create({
       model: "muse-wonder-1.0",
+      reasoning_effort: "low",
       temperature: 0.0,
       response_format: { type: "json_object" },
       messages: [

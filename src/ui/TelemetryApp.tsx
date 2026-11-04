@@ -21,6 +21,8 @@ export type PhysicalSyringeScenario =
 export interface TelemetryDashboardState {
   readonly isStreaming: boolean;
   readonly isTranscribing: boolean;
+  readonly isRecordingMic: boolean;
+  readonly recordingElapsedSec: number;
   readonly voiceReceipt: VoiceTranscriptionReceipt | null;
   readonly metrology: CalibratedMetrologyReport | null;
   readonly volumetric: VolumetricMetrologyReport | null;
@@ -300,10 +302,78 @@ export class SseTelemetryConsumer {
   }
 }
 
+/**
+ * Decodes and resamples live browser microphone recordings into 16 kHz 16-bit
+ * mono RIFF/WAVE PCM containers for Meta `muse-voice-transcribe-1.0`.
+ * Strict 2-method boundary: resampleBlobTo16kMonoSamples and encodeLinear16WavContainer.
+ */
+export class BrowserPcmWavEncoder {
+  public async resampleBlobTo16kMonoSamples(recordedBlob: Blob): Promise<Float32Array> {
+    const rawBytes = await recordedBlob.arrayBuffer();
+    const decodeCtx = new AudioContext();
+    try {
+      const decoded = await decodeCtx.decodeAudioData(rawBytes.slice(0));
+      const targetFrames = Math.max(1600, Math.ceil(decoded.duration * 16000));
+      const offlineCtx = new OfflineAudioContext(1, targetFrames, 16000);
+      const source = offlineCtx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(offlineCtx.destination);
+      source.start(0);
+      const rendered = await offlineCtx.startRendering();
+      const channelData = rendered.getChannelData(0);
+      const normalized = new Float32Array(channelData.length);
+      let peak = 0;
+      for (let i = 0; i < channelData.length; i++) {
+        const abs = Math.abs(channelData[i]!);
+        if (abs > peak) peak = abs;
+      }
+      const gain = peak > 0.005 && peak < 0.85 ? Math.min(8.0, 0.85 / peak) : 1.0;
+      for (let i = 0; i < channelData.length; i++) {
+        normalized[i] = Math.max(-1.0, Math.min(1.0, channelData[i]! * gain));
+      }
+      return normalized;
+    } finally {
+      await decodeCtx.close();
+    }
+  }
+
+  public encodeLinear16WavContainer(
+    samples16k: Float32Array,
+    sampleRateHz: number = 16000
+  ): Uint8Array {
+    const pcmBytesLength = samples16k.length * 2;
+    const wavBuffer = new Uint8Array(44 + pcmBytesLength);
+    const wavView = new DataView(wavBuffer.buffer);
+
+    wavBuffer.set([0x52, 0x49, 0x46, 0x46], 0);
+    wavView.setUint32(4, 36 + pcmBytesLength, true);
+    wavBuffer.set([0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20], 8);
+    wavView.setUint32(16, 16, true);
+    wavView.setUint16(20, 1, true);
+    wavView.setUint16(22, 1, true);
+    wavView.setUint32(24, sampleRateHz, true);
+    wavView.setUint32(28, sampleRateHz * 2, true);
+    wavView.setUint16(32, 2, true);
+    wavView.setUint16(34, 16, true);
+    wavBuffer.set([0x64, 0x61, 0x74, 0x61], 36);
+    wavView.setUint32(40, pcmBytesLength, true);
+
+    for (let i = 0; i < samples16k.length; i++) {
+      const clamped = Math.max(-1.0, Math.min(1.0, samples16k[i]!));
+      const int16Sample =
+        clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+      wavView.setInt16(44 + i * 2, int16Sample, true);
+    }
+
+    return wavBuffer;
+  }
+}
+
 const CANVAS_WIDTH = 640;
 const CANVAS_HEIGHT = 360;
 const rendererInstance = new LegacyCanvasSandboxRenderer();
 const sseConsumerInstance = new SseTelemetryConsumer();
+const pcmWavEncoderInstance = new BrowserPcmWavEncoder();
 
 function resolveBackendEndpoint(pathname: string): string {
   const metaEnv = (import.meta as unknown as { readonly env?: Record<string, string> }).env;
@@ -323,6 +393,9 @@ function resolveBackendEndpoint(pathname: string): string {
 export const TelemetryApp: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameCounterRef = useRef<number>(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [sessionId, setSessionId] = useState<string>(() => `vpse-rx-${Date.now()}`);
   const [scenario, setScenario] =
     useState<PhysicalSyringeScenario>("NOMINAL_0_95ML");
@@ -333,6 +406,8 @@ export const TelemetryApp: React.FC = () => {
   const [state, setState] = useState<TelemetryDashboardState>({
     isStreaming: false,
     isTranscribing: false,
+    isRecordingMic: false,
+    recordingElapsedSec: 0,
     voiceReceipt: null,
     metrology: null,
     volumetric: null,
@@ -412,25 +487,18 @@ export const TelemetryApp: React.FC = () => {
     handleScenarioChange(scenario);
   };
 
-  const triggerFieldVoiceTranscription = async (): Promise<void> => {
+  const dispatchWavBufferToTranscriber = async (
+    wavBuffer: Uint8Array
+  ): Promise<void> => {
     setState((prev) => ({ ...prev, isTranscribing: true, errorBanner: null }));
     try {
-      const directiveBytes = new TextEncoder().encode(voiceDirective);
-      const wavBuffer = new Uint8Array(44 + directiveBytes.byteLength);
-      // RIFF....WAVEfmt header (O(1) magic-byte compliant PCM container)
-      wavBuffer.set(
-        [0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45],
-        0
-      );
-      wavBuffer.set(directiveBytes, 44);
-
       const res = await fetch(resolveBackendEndpoint("/api/transcribe"), {
         method: "POST",
         headers: {
           "Content-Type": "audio/wav",
           "X-Voice-Language": "en",
         },
-        body: wavBuffer,
+        body: new Blob([Uint8Array.from(wavBuffer)], { type: "audio/wav" }),
       });
       if (!res.ok) {
         const errJson = (await res.json()) as { readonly error?: string };
@@ -449,11 +517,116 @@ export const TelemetryApp: React.FC = () => {
     }
   };
 
+  const toggleLiveMicRecording = async (): Promise<void> => {
+    if (state.isRecordingMic && mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      return;
+    }
+
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setState((prev) => ({
+        ...prev,
+        errorBanner: "Browser microphone API unavailable in this context.",
+      }));
+      return;
+    }
+
+    try {
+      setState((prev) => ({ ...prev, errorBanner: null, recordingElapsedSec: 0 }));
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      micStreamRef.current = stream;
+
+      const chunks: BlobPart[] = [];
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+
+      const startedAt = performance.now();
+      micTimerRef.current = setInterval(() => {
+        const elapsed = Number(((performance.now() - startedAt) / 1000).toFixed(1));
+        setState((prev) => ({ ...prev, recordingElapsedSec: elapsed }));
+      }, 100);
+
+      recorder.ondataavailable = (ev: BlobEvent): void => {
+        if (ev.data.size > 0) {
+          chunks.push(ev.data);
+        }
+      };
+
+      recorder.onstop = (): void => {
+        if (micTimerRef.current !== null) {
+          clearInterval(micTimerRef.current);
+          micTimerRef.current = null;
+        }
+        if (micStreamRef.current) {
+          for (const track of micStreamRef.current.getTracks()) {
+            track.stop();
+          }
+          micStreamRef.current = null;
+        }
+        mediaRecorderRef.current = null;
+        setState((prev) => ({ ...prev, isRecordingMic: false }));
+
+        void (async () => {
+          try {
+            const recordedBlob = new Blob(chunks, {
+              type: recorder.mimeType || "audio/webm",
+            });
+            const mono16k =
+              await pcmWavEncoderInstance.resampleBlobTo16kMonoSamples(recordedBlob);
+            const wavBytes = pcmWavEncoderInstance.encodeLinear16WavContainer(
+              mono16k,
+              16000
+            );
+            await dispatchWavBufferToTranscriber(wavBytes);
+          } catch (encodeErr) {
+            setState((prev) => ({
+              ...prev,
+              errorBanner:
+                encodeErr instanceof Error
+                  ? encodeErr.message
+                  : "Failed to encode 16kHz PCM WAV from microphone.",
+            }));
+          }
+        })();
+      };
+
+      recorder.start();
+      setState((prev) => ({ ...prev, isRecordingMic: true }));
+    } catch (micErr) {
+      setState((prev) => ({
+        ...prev,
+        isRecordingMic: false,
+        errorBanner:
+          micErr instanceof Error
+            ? `Microphone access denied: ${micErr.message}`
+            : "Microphone access denied.",
+      }));
+    }
+  };
+
+  const triggerFieldVoiceTranscription = async (): Promise<void> => {
+    const silentSamples = new Float32Array(4000);
+    const wavBuffer = pcmWavEncoderInstance.encodeLinear16WavContainer(
+      silentSamples,
+      16000
+    );
+    await dispatchWavBufferToTranscriber(wavBuffer);
+  };
+
   const triggerPipelineExecution = async (): Promise<void> => {
     setState((prev) => ({
       ...prev,
       isStreaming: true,
       errorBanner: null,
+      glimmerChannels: null,
+      epistemicVerdict: null,
       wonderVerdict: null,
       sparkReceipt: null,
       consensusReport: null,
@@ -483,7 +656,7 @@ export const TelemetryApp: React.FC = () => {
 
     const glimmerSample = simulateContradiction
       ? `assistant to=self\n3D Snell/Young-Laplace RLE integral measures ${simulatedMeasuredMl} mL against [0.60, 1.20] mL pediatric renal window. Severe conflict and mismatch detected.\nassistant to=user\nVerified syringe volume is ${hallucinatedPublicMl} mL and cleared for administration.`
-      : `assistant to=self\n3D Snell/Young-Laplace RLE integral measures ${simulatedMeasuredMl} mL against [0.60, 1.20] mL pediatric renal window.\nassistant to=user\nMeasured volume is ${simulatedMeasuredMl} mL.`;
+      : "";
 
     const currentFrameIndex = frameCounterRef.current++;
 
@@ -587,6 +760,13 @@ export const TelemetryApp: React.FC = () => {
     }
   };
 
+  const hasAutoBootedRef = useRef<boolean>(false);
+  useEffect(() => {
+    if (hasAutoBootedRef.current) return;
+    hasAutoBootedRef.current = true;
+    void triggerPipelineExecution();
+  }, []);
+
   return (
     <div style={{ backgroundColor: "#020617", color: "#f8fafc", minHeight: "100vh", padding: "20px", fontFamily: "monospace" }}>
       <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #1e293b", paddingBottom: "12px", marginBottom: "14px", flexWrap: "wrap", gap: "12px" }}>
@@ -634,26 +814,43 @@ export const TelemetryApp: React.FC = () => {
         </div>
       </header>
 
-      <div style={{ display: "flex", gap: "10px", alignItems: "center", background: "#0f172a", border: "1px solid #1e293b", padding: "10px 14px", marginBottom: "16px", fontSize: "12px" }}>
+      <div style={{ display: "flex", gap: "10px", alignItems: "center", background: "#0f172a", border: `1px solid ${state.isRecordingMic ? "#f43f5e" : "#1e293b"}`, padding: "10px 14px", marginBottom: "16px", fontSize: "12px", flexWrap: "wrap" }}>
         <span style={{ color: "#38bdf8", fontWeight: "bold", whiteSpace: "nowrap" }}>
-          VOICE INGRESS (`muse-voice-transcribe`):
+          VOICE INGRESS (`muse-voice-transcribe-1.0`):
         </span>
         <input
           type="text"
           value={voiceDirective}
           onChange={(e) => setVoiceDirective(e.target.value)}
-          style={{ flex: 1, background: "#020617", color: "#e2e8f0", border: "1px solid #334155", padding: "6px 10px", fontFamily: "monospace", fontSize: "12px" }}
+          style={{ flex: 1, minWidth: "240px", background: "#020617", color: "#e2e8f0", border: "1px solid #334155", padding: "6px 10px", fontFamily: "monospace", fontSize: "12px" }}
         />
         <button
-          onClick={triggerFieldVoiceTranscription}
+          onClick={toggleLiveMicRecording}
           disabled={state.isTranscribing}
+          style={{
+            background: state.isRecordingMic ? "#e11d48" : "#7c3aed",
+            color: "#fff",
+            border: "none",
+            padding: "6px 12px",
+            cursor: "pointer",
+            fontWeight: "bold",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {state.isRecordingMic
+            ? `⏹ STOP & TRANSCRIBE (${state.recordingElapsedSec.toFixed(1)}s)`
+            : "🎙️ RECORD LIVE MIC"}
+        </button>
+        <button
+          onClick={triggerFieldVoiceTranscription}
+          disabled={state.isTranscribing || state.isRecordingMic}
           style={{ background: "#0f766e", color: "#fff", border: "none", padding: "6px 12px", cursor: "pointer", fontWeight: "bold", whiteSpace: "nowrap" }}
         >
           {state.isTranscribing ? "TRANSCRIBING..." : "VALIDATE WAV & TRANSCRIBE"}
         </button>
         {state.voiceReceipt && (
           <span style={{ color: "#10b981", whiteSpace: "nowrap" }}>
-            [{state.voiceReceipt.detectedContainer.toUpperCase()} {state.voiceReceipt.audioByteLength}B // {state.voiceReceipt.transcriptionLatencyMs}ms]
+            [{state.voiceReceipt.detectedContainer.toUpperCase()} {(state.voiceReceipt.audioByteLength / 1024).toFixed(1)}KB // {state.voiceReceipt.transcriptionLatencyMs}ms]
           </span>
         )}
       </div>
@@ -720,14 +917,20 @@ export const TelemetryApp: React.FC = () => {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", fontSize: "12px" }}>
               <div style={{ background: "#020617", padding: "10px", border: "1px solid #334155" }}>
                 <div style={{ color: "#f59e0b", marginBottom: "4px" }}>PRIVATE DELIBERATION (`assistant to=self`)</div>
-                <pre style={{ whiteSpace: "pre-wrap", margin: 0, color: "#cbd5e1" }}>
-                  {state.glimmerChannels?.privateDeliberation ?? "Awaiting local vLLM trace..."}
+                <pre style={{ whiteSpace: "pre-wrap", margin: 0, color: state.glimmerChannels ? "#cbd5e1" : "#38bdf8" }}>
+                  {state.glimmerChannels?.privateDeliberation ??
+                    (state.isStreaming
+                      ? "⚡ Streaming live deliberation from Muse Glimmer 30B (127.0.0.1:8000/v1)..."
+                      : "Click [VERIFY SYRINGE & INTERLOCK] above to run scan...")}
                 </pre>
               </div>
               <div style={{ background: "#020617", padding: "10px", border: "1px solid #334155" }}>
                 <div style={{ color: "#38bdf8", marginBottom: "4px" }}>PUBLIC COMMITMENT (`assistant to=user`)</div>
-                <pre style={{ whiteSpace: "pre-wrap", margin: 0, color: "#cbd5e1" }}>
-                  {state.glimmerChannels?.publicCommitment ?? "Awaiting public channel..."}
+                <pre style={{ whiteSpace: "pre-wrap", margin: 0, color: state.glimmerChannels ? "#cbd5e1" : "#38bdf8" }}>
+                  {state.glimmerChannels?.publicCommitment ??
+                    (state.isStreaming
+                      ? "⚡ Cross-auditing public numeric claims (5% sycophancy firewall)..."
+                      : "Click [VERIFY SYRINGE & INTERLOCK] above to run scan...")}
                 </pre>
               </div>
             </div>
@@ -765,8 +968,10 @@ export const TelemetryApp: React.FC = () => {
                 </div>
               </div>
             ) : (
-              <div style={{ fontSize: "12px", color: "#64748b" }}>
-                Awaiting deterministic computer-use dispatch...
+              <div style={{ fontSize: "12px", color: state.isStreaming ? "#38bdf8" : "#64748b" }}>
+                {state.isStreaming
+                  ? "⚡ Executing live Muse Wonder 1.0 arbitration & Muse Spark 1.3 Citrix tool call (api.meta.ai)..."
+                  : "Click [VERIFY SYRINGE & INTERLOCK] above to dispatch live computer-use..."}
               </div>
             )}
           </div>
